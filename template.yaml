@@ -1,0 +1,119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Zero Server Cloud Build: serverless file processing with S3, Lambda and SNS (least privilege)'
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address that receives a message for every processed file
+
+Resources:
+  # ==========================================
+  # 1. STORAGE
+  # ==========================================
+  # Bucket names are built with !Sub (not !Ref) so the IAM policy and the
+  # notification can point at them without a circular dependency.
+  InboxBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: InboxInvokePermission
+    Properties:
+      BucketName: !Sub 'zero-server-inbox-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessorFunction.Arn
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'zero-server-output-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ==========================================
+  # 2. MESSAGING
+  # ==========================================
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: zero-server-notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # ==========================================
+  # 3. COMPUTE (least privilege)
+  # ==========================================
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: ZeroServerLeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/zero-server-processor*'
+              - Sid: ReadAndRemoveFromInbox
+                Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub 'arn:aws:s3:::zero-server-inbox-${AWS::AccountId}-${AWS::Region}/*'
+              - Sid: WriteToOutput
+                Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub 'arn:aws:s3:::zero-server-output-${AWS::AccountId}-${AWS::Region}/*'
+              - Sid: NotifyOneTopic
+                Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref NotificationTopic
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: zero-server-processor
+      Handler: handler.lambda_handler
+      Runtime: python3.12
+      Timeout: 30
+      Role: !GetAtt ProcessorRole.Arn
+      Code: src/
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Sub 'zero-server-output-${AWS::AccountId}-${AWS::Region}'
+          TOPIC_ARN: !Ref NotificationTopic
+
+  InboxInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessorFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::zero-server-inbox-${AWS::AccountId}-${AWS::Region}'
+
+Outputs:
+  InboxBucket:
+    Description: Upload files here
+    Value: !Ref InboxBucket
+  OutputBucket:
+    Description: Sorted results (processed/ and rejected/)
+    Value: !Ref OutputBucket
